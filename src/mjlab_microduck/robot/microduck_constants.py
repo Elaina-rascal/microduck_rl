@@ -2,6 +2,9 @@ import os
 from pathlib import Path
 
 import mujoco
+# 中文主线第 5 站：给 cfg.scene.entities["robot"] 提供机器人构造配方。
+# MJCF 决定几何/关节/质量，HOME 决定初始关节角和动作默认偏置，执行器 cfg 决定目标怎样产生力矩。
+# EntityCfg 只是配置；外部 mjlab 创建环境时才调用 spec_fn() 并 build/initialize 执行器。
 from mjlab.actuator import XmlActuatorCfg
 from mjlab_microduck.actuator import (
     BacklashEncoderBamActuatorCfg,
@@ -47,6 +50,8 @@ assert MICRODUCK_ALLCOLLISIONS_BACKLASH_XML.exists(), f"XML not found: {MICRODUC
 
 
 def get_walk_spec() -> mujoco.MjSpec:
+    # 外部 MuJoCo 接口：MJCF 文件路径 → MjSpec（可编辑的模型描述），不是仿真状态或策略。
+    # mjlab 随后编译模型并建立各环境的状态；平地走路用 walk 碰撞族，倒地任务另选 groundcontact。
     return mujoco.MjSpec.from_file(str(MICRODUCK_WALK_XML))
 
 
@@ -113,6 +118,8 @@ def get_rollers_backlash_spec() -> mujoco.MjSpec:
     return mujoco.MjSpec.from_file(str(MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML))
 
 
+# 外部 InitialStateCfg 接口：名字/正则 → 默认关节位置（rad）或速度（rad/s）。
+# 这些值既用于重置，又作为相对观测和位置动作的默认偏置；更换 HOME 会改变策略的物理含义。
 HOME_FRAME = EntityCfg.InitialStateCfg(
     joint_pos={
         # Lower body — STAND2 pose: trunk shifted ~5mm forward over the feet so
@@ -139,6 +146,7 @@ HOME_FRAME = EntityCfg.InitialStateCfg(
     joint_vel={".*": 0.0},
 )
 
+# CollisionCfg 用名称选择碰撞几何并设置接触参数；不会自动给模型中所有可见网格增加碰撞。
 FULL_COLLISION = CollisionCfg(
     geom_names_expr=[".*_collision"],
     condim={r"^(left|right)_foot_collision$": 3, ".*_collision": 1},
@@ -160,6 +168,8 @@ FULL_COLLISION = CollisionCfg(
 #   - vin_drop_gain_range: load-dependent voltage sag V_drop = gain * sum(|tau|)
 #   - vin_min: hard floor on the effective voltage after sag
 # kp_fw kept at 200 (microduck's preserved firmware stiffness; microban uses 125).
+# 外部 BamActuatorCfg 的关键输入：XL330 的 M6 电机模型、受控关节名称、固件位置环和电池条件。
+# 执行器接收目标/当前关节状态，模拟电压控制与摩擦，输出物理作用力矩；不是理想位置瞬移。
 _BAM_ACTUATOR_KWARGS = dict(
     motor_name="xl330",
     model="m6",
@@ -173,6 +183,7 @@ _BAM_ACTUATOR_KWARGS = dict(
     delay_min_lag=3,
     delay_max_lag=6,
 )
+# 这里构造配置实例；本仓库的子类仅补充 friction_scale，底层力矩计算沿用 BAM。
 actuators = FrictionDRBamActuatorCfg(**_BAM_ACTUATOR_KWARGS)
 
 # Same BAM actuator, but the firmware position loop reads the encoder THROUGH
@@ -199,6 +210,8 @@ BACKLASH_HOME_FRAME = EntityCfg.InitialStateCfg(
     joint_vel={".*": 0.0},
 )
 
+# 返回给走路任务的 EntityCfg：mjlab 按 spec_fn 创建模型，再绑定默认姿态、碰撞和执行器。
+# actuator 的选择排除 passive_*；关节数组可能多于 14，但策略动作仍只控制 14 个舵机。
 MICRODUCK_WALK_ROBOT_CFG = EntityCfg(
     spec_fn=get_walk_spec,
     init_state=HOME_FRAME,

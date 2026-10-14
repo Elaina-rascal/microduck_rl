@@ -1,3 +1,6 @@
+# 中文主线第 1 站：把命令里的任务 ID 绑定到环境配置、训练配置和 Runner。
+# 此模块由 mjlab 的插件加载器导入；注册配置不等于创建仿真环境或开始训练。
+# 简单走路只需先读下面的 MicroduckOnPolicyRunner 和第一个 register_mjlab_task 调用。
 from mjlab_microduck.train_hook import maybe_submit_to_hf_jobs
 
 # `train <task> ... --hf-jobs` submits to HF Jobs and exits here, before any
@@ -12,7 +15,12 @@ from mjlab.tasks.velocity.rl import VelocityOnPolicyRunner
 
 class MicroduckOnPolicyRunner(VelocityOnPolicyRunner):
     def __init__(self, env, train_cfg: dict, log_dir=None, device="cpu", **kwargs):
+        # 外部 Runner 构造接口：env 是 mjlab 的 RslRlVecEnvWrapper，train_cfg 是 asdict 后的字典；
+        # log_dir 指定日志/模型目录，device 决定网络运算设备。构造会建立 self.alg（PPO）和日志器。
+        # 本类沿用父类 learn()：每轮采样 N×24 条数据、计算优势，再更新 Actor/Critic。
+        # env.get_observations() → TensorDict；env.step(a[N,14]) → (obs, reward[N], dones[N], extras)。
         super().__init__(env, train_cfg, log_dir, device, **kwargs)
+        # 这里仅处理可序列化的配置副本；对称损失默认关闭，不是另外实现一套 PPO。
         # resolve_symmetry_config injects _env into train_cfg["algorithm"]["symmetry_cfg"]
         # in-place, sharing the same dict object with self.alg.symmetry.  Replace the
         # train_cfg reference with a copy that omits _env so dump_yaml can serialize the
@@ -78,14 +86,22 @@ from .microduck_roulade_env_cfg import (
 from .backlash import make_backlash_variant
 
 # Standard velocity task
+# 外部注册接口：四个参数合起来是一项任务，返回后只把配置保存到 mjlab 注册表。
+# 命令行的 --env.* / --agent.* 会在取出配置后覆盖这些默认值；修改下面 cfg 才是改任务配方。
 register_mjlab_task(
+    # 命令里的精确名称；Flat 是平地，MicroDuck 是机器人，Velocity 是速度跟踪目标。
     task_id="Mjlab-Velocity-Flat-MicroDuck",
+    # 训练环境配置实例：观测、动作、奖励、事件、课程，以及机器人/地面配置。
     env_cfg=make_microduck_velocity_env_cfg(),
+    # play 另取这套配置；仍有随机化，不能把 viewer 理解成纯粹关掉训练更新。
     play_env_cfg=make_microduck_velocity_env_cfg(play=True),
+    # 网络和 PPO 超参数配置实例，定义在走路 cfg 文件末尾。
     rl_cfg=MicroduckRlCfg,
+    # 类而非实例：训练器创建环境后才实例化 Runner。
     runner_cls=MicroduckOnPolicyRunner,
 )
 
+# 后面都是其他任务或变体的注册。第一次阅读可直接跳到走路 cfg，暂不逐项展开。
 register_mjlab_task(
     task_id="Mjlab-Velocity-Rough-MicroDuck",
     env_cfg=make_microduck_velocity_env_cfg(rough=True),

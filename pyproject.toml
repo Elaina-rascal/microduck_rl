@@ -38,9 +38,13 @@ dependencies = [
 ]
 
 [project.entry-points."mjlab.tasks"]
+# 中文阅读入口：mjlab 启动时通过这个插件入口导入 tasks/__init__.py，注册 Microduck 任务。
+# 这里导入模块，不创建 GPU 环境；实际环境由训练器选中任务后构建。
 mjlab_microduck = "mjlab_microduck.tasks"
 
 [project.scripts]
+# 安装后 train 是一个 Python 命令入口。mjlab 也声明同名命令，两种入口最终调用同一训练器。
+# 本仓库的调用接口与训练主线说明见 src/mjlab_microduck/train_cli.py。
 # This name collides with mjlab's `train` ON PURPOSE and must stay declared.
 # Same-name console scripts are last-writer-wins and both dist-info RECORDs
 # then claim bin/train, so deleting this line does NOT hand the name back to

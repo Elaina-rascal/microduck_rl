@@ -24,11 +24,16 @@ import torch
 from bam.mjlab import BamActuator, BamActuatorCfg
 from mjlab.actuator.actuator import ActuatorCmd
 
+# 中文主线第 6 站：本仓库连接外部 BAM 的适配层；位置目标最终在父类 compute() 中转成力矩。
+# FrictionDRBamActuator 只增加摩擦随机化倍率；BacklashEncoderBamActuator 再适配输出侧编码器读数。
+
 
 class FrictionDRBamActuator(BamActuator):
     """BamActuator + per-env friction_scale on the BAM friction budget."""
 
     def initialize(self, mj_model, model, data, device) -> None:
+        # 外部生命周期接口：mj_model 是 CPU 模型，model/data 是 Warp 模型/状态，device 是运算设备。
+        # 父类先建立 N 环境、J 受控关节的执行器状态；本类随后补上 [N,1] 摩擦倍率。
         super().initialize(mj_model, model, data, device)
         # kp_scale is (num_envs, 1); mirror it for a per-env friction multiplier.
         self.friction_scale = torch.ones_like(self.kp_scale)
@@ -40,6 +45,8 @@ class FrictionDRBamActuator(BamActuator):
         external_torque: torch.Tensor,
         stribeck_coeff: torch.Tensor,
     ) -> torch.Tensor:
+        # 外部 BAM hook：三个输入是参与摩擦计算的逐环境/关节 Tensor，返回基础摩擦力矩预算 [N,J]。
+        # friction_scale[N,1] 广播到所有 J 个受控关节；只缩放这类摩擦预算，未改粘性摩擦项。
         base = super()._compute_friction_budget(
             motor_torque, external_torque, stribeck_coeff
         )
@@ -50,6 +57,7 @@ class FrictionDRBamActuator(BamActuator):
         self.friction_scale[env_ids] = friction_scale
 
     def reset_friction_scale(self, env_ids) -> None:
+        # reset 事件先恢复默认值再设置新的采样倍率，避免每个 episode 都继续累乘上一次的扰动。
         self.friction_scale[env_ids] = self.default_friction_scale[env_ids]
 
 
@@ -58,6 +66,7 @@ class FrictionDRBamActuatorCfg(BamActuatorCfg):
     """Drop-in for BamActuatorCfg that builds a friction-DR-capable actuator."""
 
     def build(self, entity, target_ids, target_names) -> FrictionDRBamActuator:
+        # 外部 ActuatorCfg 工厂接口：实体、受控目标索引和名字 → 实际执行器实例（此时尚未 initialize）。
         return FrictionDRBamActuator(self, entity, target_ids, target_names)
 
 
@@ -99,6 +108,8 @@ class BacklashEncoderBamActuator(FrictionDRBamActuator):
         )
 
     def get_command(self, data) -> ActuatorCmd:
+        # 外部 get_command(data) → ActuatorCmd：包含目标和当前 pos/vel 等 Tensor[N,J]。
+        # cmd.pos 是当前反馈位置，不是策略目标；这里加齿隙角，让父类位置环读输出侧编码器。
         cmd = super().get_command(data)
         pos = cmd.pos + data.joint_pos[:, self._backlash_joint_ids] * self._backlash_mask
         return dataclasses.replace(cmd, pos=pos)

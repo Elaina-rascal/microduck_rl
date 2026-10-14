@@ -12,6 +12,8 @@ wheels/
 
 # Virtual environments
 .venv
+.venv-tools/
+.cache-local/
 
 # Logs and databases
 wandb

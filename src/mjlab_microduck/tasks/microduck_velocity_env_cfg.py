@@ -19,6 +19,18 @@ gait/feet terms, curriculum-ramped action-rate smoothing), with:
 import math
 from copy import deepcopy
 
+# 中文主线第 2 站：本文件是“走路任务配方”，上半部构造环境 cfg，末尾构造网络/PPO cfg。
+# 外部库负责训练循环，本文件决定它优化的问题。N 表示并行环境数，J=14 表示主动关节数。
+# 第一次读：make_microduck_velocity_env_cfg() → 机器人/动作 → 奖励 → 观测 → 命令 → 课程
+# → MicroduckRlCfg。rough 地形和未启用的 ENABLE_* 分支可以先跳过。
+# 管理器接口约定：ObservationTermCfg.func(env, **params) → Tensor[N,D]；
+# RewardTermCfg.func(env, **params) → Tensor[N]（原始分数，管理器再乘权重与控制步长）；
+# TerminationTermCfg.func(env, **params) → BoolTensor[N]；
+# EventTermCfg.func(env, env_ids, **params) 通常直接修改指定环境、无返回值；
+# CurriculumTermCfg.func(env, env_ids, **params) 修改运行中的 term 配置，返回值用于记录阶段指标。
+# 下文的 func=... 是注册函数引用，params 是将来调用时的关键字参数；在此处并未执行函数。
+
+# 每次 PPO 迭代从“每一个环境”采样 24 个控制步，批量数据量为 N×24。
 NUM_STEPS_PER_ENV = 24
 
 # Fraction of envs commanded to spin on the spot (lin=0, |ang| ∈ [0.4·max, max]).
@@ -28,6 +40,7 @@ TURN_IN_PLACE_FRACTION = 0.15
 ENABLE_SYMMETRY = False
 
 # Domain randomization toggles
+# DR（域随机化）让不同环境的物理参数/传感误差不同，以适应真机差异；不是给策略额外输入。
 ENABLE_COM_RANDOMIZATION = True
 ENABLE_HEAD_COM_RANDOMIZATION = True  # Randomize CoM of the head assembly bodies
 ENABLE_KP_RANDOMIZATION = False # Was True
@@ -101,6 +114,8 @@ from mjlab.managers import (
     TerminationTermCfg,
 )
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+# SceneEntityCfg 接口：实体名 + 关节/刚体/站点名（支持正则）→ Manager 初始化时解析出的具体索引。
+# 自定义函数应使用解析结果或 _servo_joint_ids；有 passive_* 时不能硬编码 MuJoCo 的原始关节列号。
 from mjlab.rl import (
     RslRlOnPolicyRunnerCfg,
     RslRlModelCfg,
@@ -118,6 +133,8 @@ from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
+# 两个 mdp 命名空间：mdp 是 mjlab 的通用函数；microduck_mdp 是本仓库 tasks/mdp.py 的定制函数。
+# 调参先看下面的 weight/params；要看一个指标如何计算，再按 func 名字跳进对应 mdp 文件。
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
@@ -196,6 +213,9 @@ def make_microduck_velocity_env_cfg(
 ) -> ManagerBasedRlEnvCfg:
     """Create Microduck velocity tracking environment configuration."""
 
+    # 工厂接口：play=False, rough=False 对应最简单的平地训练；返回 ManagerBasedRlEnvCfg。
+    # 这个返回值只是配置。mjlab 随后用 ManagerBasedRlEnv(cfg, device) 才创建 GPU 仿真环境。
+    # CLI 的 --env.scene.num-envs 等参数也会在实际创建环境前写入这份配置。
     std_standing = {
         # Lower body — tighter to keep the robot in home pose when standing
         r".*hip_yaw.*": 0.1,
@@ -216,6 +236,9 @@ def make_microduck_velocity_env_cfg(
 
     site_names = ["left_foot", "right_foot"]
 
+    # ContactSensorCfg 接口：primary/secondary 选择两组碰撞对象，fields 指定读取接触存在性/力。
+    # 这里只给传感器配方；运行时通过 env.scene["feet_ground_contact"].data 读取每环境的脚接触。
+    # LEFT/RIGHT 顺序也用于奖励和 Critic 观测，不能按字符串排序任意交换。
     # Contact sensor for feet - LEFT, RIGHT order
     feet_ground_cfg = ContactSensorCfg(
         name="feet_ground_contact",
@@ -260,19 +283,29 @@ def make_microduck_velocity_env_cfg(
     )
 
     # Base configuration
+    # 外部 make_velocity_env_cfg() → 通用速度跟踪 cfg：已包含基础观测、关节动作、奖励、重置等。
+    # 本任务继承 0.005 s 物理步长、decimation=4，因此策略每 0.02 s（50 Hz）给一次动作。
+    # 下面逐项覆盖模板配置，避免每个新任务重新实现同一套训练基础设施。
     cfg = make_velocity_env_cfg()
 
     # Robot setup
+    # EntityCfg 接口定义“怎么创建 robot”：MJCF、HOME、碰撞和 BAM 执行器；具体定义见 robot 文件。
     cfg.scene.entities = {"robot": MICRODUCK_WALK_ROBOT_CFG}
     cfg.scene.sensors = (feet_ground_cfg, self_collision_cfg, foot_height_scan_cfg)
     cfg.viewer.body_name = "trunk_base"
 
     # Action configuration
+    # 外部 JointPositionAction：输入 policy 的 Tensor[N,14]，缩放/偏置后交给执行器位置目标接口。
+    # 模板 use_default_offset=True；这里 scale=1.0，即修正前 q_target=HOME+action（旋转关节为 rad）。
+    # 这是位置目标而非直接力矩；BAM 再根据目标、当前状态和电压等算力矩，关节不会瞬间到位。
     joint_pos_action = cfg.actions["joint_pos"]
     assert isinstance(joint_pos_action, JointPositionActionCfg)
     joint_pos_action.scale = 1.0
 
     # === REWARDS ===
+    # 每个奖励函数对 N 个环境各返回一个数。默认总奖励 r=0.02×sum(weight×原始分数)。
+    # “正 cost×负 weight”和“自带负号的 penalty×正 weight”都形成惩罚；不能只根据函数名猜符号。
+    # 这里在改现有奖励的参数/权重；新奖励则需要新增 RewardTermCfg(func=..., weight=..., params=...)。
     # Pose reward configuration
     cfg.rewards["pose"].params["std_standing"] = std_standing  # tight when command=0
     cfg.rewards["pose"].params["std_walking"] = std_walking
@@ -339,6 +372,8 @@ def make_microduck_velocity_env_cfg(
     cfg.rewards["angular_momentum"].weight = -0.02
 
     # Velocity tracking rewards
+    # 主任务奖励：跟踪 twist=(vx,vy,wz)，线速度单位 m/s，角速度单位 rad/s。
+    # std 控制误差容忍度；提高总 reward 不一定在走路，要同时检查这两项和实际速度。
     cfg.rewards["track_linear_velocity"].weight = 2.0
     cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
     cfg.rewards["track_angular_velocity"].weight = 2.0
@@ -359,6 +394,8 @@ def make_microduck_velocity_env_cfg(
     # 4 neck/head DOFs a position objective, so the neck is fully shaped.
 
     # Events
+    # 事件 mode 决定何时调用：startup 仅初始化时、reset 每次 episode 重置、interval 周期性调用。
+    # env_ids 是要操作的环境编号，不是关节编号。事件一般直接改变物理参数或状态，不返回奖励。
     # BAM (mjlab_frictionloss branch) writes per-env dof_frictionloss/dof_damping
     # every step; this no-op event registers those fields for per-world expansion.
     cfg.events["expand_bam_friction_fields"] = EventTermCfg(
@@ -388,6 +425,8 @@ def make_microduck_velocity_env_cfg(
     cfg.events["reset_base"].params["pose_range"]["z"] = (0.12, 0.13)
 
     # Velocity-based pushes for robustness training
+    # 外部推扰接口 push_by_setting_velocity(env, env_ids, velocity_range, asset_cfg)：
+    # 修改 robot 的速度，让策略学平衡恢复；play 下推得更频繁，不等于无扰动的性能评估。
     if ENABLE_VELOCITY_PUSHES:
         # In play mode, use shorter interval for better visibility
         interval = (0.5, 1.0) if play else VELOCITY_PUSH_INTERVAL_S
@@ -529,6 +568,9 @@ def make_microduck_velocity_env_cfg(
         )
 
     # Observations
+    # Actor 输入必须是部署可提供的信息；Critic 可使用额外仿真信息辅助价值估计（非对称训练）。
+    # 下面去掉 Actor 的机身线速度/地形扫描，但 Critic 仍保留线速度及脚接触等特权信息。
+    # 走路最终 Actor=61D、Critic=76D；下文只保留 14 个主动关节，并在末尾加入头/身体命令。
     del cfg.observations["actor"].terms["base_lin_vel"]
     # mjlab 1.3.0 adds a height_scan term (terrain ray scan) to both groups by
     # default. The microduck has no such body-mounted terrain sensor for the
@@ -562,6 +604,7 @@ def make_microduck_velocity_env_cfg(
     )
 
     cfg.observations["actor"].terms["base_ang_vel"].delay_min_lag = 0
+    # delay_* 的 lag 单位是控制步；1 步=20 ms。噪声/延迟作用在观测，模拟传感器而非改变真值。
     cfg.observations["actor"].terms["base_ang_vel"].delay_max_lag = 1  # was 3 (=60 ms worst case); real dxl IMU path is fast — ±20 ms envelope (2026-07 audit)
     cfg.observations["actor"].terms["base_ang_vel"].delay_update_period = 64
 
@@ -635,6 +678,8 @@ def make_microduck_velocity_env_cfg(
         cfg.events.pop("encoder_bias", None)
 
     # Commands — deepcopy to avoid shared-state corruption from other env cfgs
+    # CommandManager 管理命令采样；get_command("twist") → Tensor[N,3]，作为观测和奖励的共同目标。
+    # UniformVelocityCommandCfg 是采样配置，不是网络。重采样前保持命令；精确零命令用于学待机。
     # (make_velocity_env_cfg() returns objects with shared mutable references;
     # standup/ground_pick envs mutate commands["twist"] in place, zeroing ranges)
     command: UniformVelocityCommandCfg = deepcopy(cfg.commands["twist"])
@@ -664,6 +709,7 @@ def make_microduck_velocity_env_cfg(
     #   head_roll               : ±0.31 rad (limit ±20°)
     # Initial ranges are small non-zero so input neurons stay alive from step 0.
     cfg.commands["head_pose"] = microduck_mdp.UniformPoseCommandCfg(
+        # 自定义 CommandTerm 接口：ranges 的长度决定维数，这里输出 [N,4] 的 HOME 关节角增量。
         resampling_time_range=HEAD_POSE_CMD_RESAMPLE_S,
         ranges=(
             (-0.05, 0.05),    # neck_pitch
@@ -677,6 +723,7 @@ def make_microduck_velocity_env_cfg(
     # weight to keep the input neurons alive but not steer the policy. The
     # standup env raises the weight + widens the ranges.
     cfg.commands["body_pose"] = microduck_mdp.UniformPoseCommandCfg(
+        # 输出 [N,6]，顺序为 x/y/z（m）和 roll/pitch/yaw（rad）；保留共享接口，走路跟踪权重为 0。
         resampling_time_range=BODY_POSE_CMD_RESAMPLE_S,
         ranges=(
             (-0.005, 0.005),  # x (m)
@@ -689,6 +736,9 @@ def make_microduck_velocity_env_cfg(
     )
 
     # Append head + body command obs terms to both policy and critic groups.
+    # 外部 generated_commands(env, command_name) → 原样取出命令 Tensor[N,D]，由 ObservationManager 拼接。
+    # Actor 固定布局：[角速度3, 重力方向3, 相对关节角14, 关节速度14, 上一步动作14,
+    #                  twist3, head_pose4, body_pose6]。网络和 ONNX 都依赖这一顺序，总长 61。
     # Order matters for the runtime obs layout: [twist(3), head_pose(4), body_pose(6)].
     for group in ("actor", "critic"):
         cfg.observations[group].terms["head_command"] = ObservationTermCfg(
@@ -708,6 +758,7 @@ def make_microduck_velocity_env_cfg(
     # curriculum widening doesn't kill the signal. Final reward is the mean
     # over 4 joints, so partial tracking is partial reward (no all-or-nothing).
     cfg.rewards["head_pose_tracking"] = RewardTermCfg(
+        # 自定义函数输出 [N]、范围 [0,1]；weight=2.0 由 RewardManager 施加，不在函数里重复乘。
         func=microduck_mdp.head_pose_tracking,
         weight=2.0,
         params={"command_name": "head_pose", "std": 0.5},
@@ -739,12 +790,14 @@ def make_microduck_velocity_env_cfg(
     # to cancel gravity sag), so price only that: L1 on a 1 s EMA of the error.
     # At the optimum this costs a walking policy nothing.
     cfg.rewards["head_pose_bias"] = RewardTermCfg(
+        # 该 penalty 已返回负值，所以课程启用后用正权重；EMA 衡量持续偏差，容许步行时头部摆动。
         func=microduck_mdp.head_pose_bias_penalty,
         weight=0.0,  # ramped by the head_pose_bias_weight curriculum below
         params={"command_name": "head_pose", "tau_s": 1.0},
     )
 
     # Terrain
+    # Flat 走 plane 分支；rough=True 才使用上方复杂地形配置，初读简单走路可以跳过 else。
     if not rough:
         cfg.scene.terrain.terrain_type = "plane"
         cfg.scene.terrain.terrain_generator = None
@@ -774,6 +827,9 @@ def make_microduck_velocity_env_cfg(
             cfg.scene.terrain.terrain_generator.num_rows = 5
 
     # action_rate weight ramp: gentle smoothing while the gait bootstraps, then
+    # CurriculumManager 接口：回调读取 env.common_step_counter 并修改 Manager 内的运行时配置。
+    # step=iteration×24，不乘 N；weight_stages 是分阶段切换，不是每步做线性插值。
+    # 返回的 Tensor 是日志指标；课程本身不直接作为 reward 或 PPO loss。
     # tighten to -1.0 by iter 1500.
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
@@ -909,31 +965,42 @@ def make_microduck_velocity_env_cfg(
     return cfg
 
 
+# 中文主线第 3 站：训练配置实例，与上面的环境 cfg 分开；--agent.* 覆盖这里的字段。
+# 外部 RslRlOnPolicyRunnerCfg 经 asdict 变成字典，Runner 据此构造 MLPModel、GaussianDistribution 和 PPO。
+# Actor/Critic 都先归一化再进网络；Actor 部署时保留归一化器，Critic 只用于训练。
 MicroduckRlCfg = RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
+        # Actor：走路观测 [N,61] → 隐藏层 512/256/128 → 动作均值 [N,14]。
         hidden_dims=(512, 256, 128),
         activation="elu",
         obs_normalization=True,
         distribution_cfg={
+            # 训练 act(obs, stochastic_output=True) 从高斯分布采样探索；播放默认输出均值。
             "class_name": "GaussianDistribution",
             "init_std": 1.0,
             "std_type": "scalar",
         },
     ),
     critic=RslRlModelCfg(
+        # Critic：本任务观测 [N,76] → 隐藏层 512/256/128 → 价值 V(obs)[N,1]。
         hidden_dims=(512, 256, 128),
         activation="elu",
         obs_normalization=True,
     ),
     algorithm=PpoWithSymmetryCfg(
+        # PPO.update() 接口在 rsl_rl：使用刚采集的 rollout 更新 Actor/Critic，返回损失日志字典。
+        # 损失=策略裁剪损失 + value_loss_coef×价值损失 - entropy_coef×策略熵（对称项默认关闭）。
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
+        # 限制新旧动作概率比的更新幅度；不是动作输出的截幅。
         clip_param=0.2,
         entropy_coef=0.01,
+        # 每轮 N×24 样本拆成 4 批、重复 5 遍，通常 20 次优化器更新，之后重新采样。
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,
         schedule="adaptive",
+        # gamma 是回报折扣；lam 是 GAE 的递推系数，结合 Critic 估计构造优势 A。
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
@@ -944,6 +1011,7 @@ MicroduckRlCfg = RslRlOnPolicyRunnerCfg(
     experiment_name="velocity",  # Directory name
     run_name="velocity",  # Appended to datetime in wandb: <datetime>_velocity
     save_interval=250,
+    # Runner.learn 每个环境采样 24 步后做一次 PPO 更新；5 次迭代是流程检查，不能代表学会走路。
     num_steps_per_env=24,
     max_iterations=50_000,
 )

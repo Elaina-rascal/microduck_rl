@@ -52,6 +52,8 @@ def maybe_submit_to_hf_jobs() -> None:
     the loader's `except Exception` and out of `import mjlab` — the local
     trainer never starts.
     """
+    # 本地简单训练走这条早返回：没有 --hf-jobs 时不提交远程任务，也不修改参数。
+    # 这是启动分流接口，不参与 env.step()、采样或 PPO 更新，第一次读走路任务可跳过后面。
     if _FLAG not in sys.argv[1:]:
         return
     if os.environ.get(_IN_JOB_ENV):
@@ -61,4 +63,5 @@ def maybe_submit_to_hf_jobs() -> None:
 
     from mjlab_microduck.hf_jobs import submit
 
+    # submit 接收去掉 --hf-jobs 的命令参数列表；提交结果用作退出码，当前进程不再本地训练。
     sys.exit(submit([a for a in sys.argv[1:] if a != _FLAG]))

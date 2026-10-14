@@ -1,5 +1,12 @@
 """MDP functions for microduck tasks"""
 
+# 中文主线第 4 站：这里提供 Manager 的回调函数，不是训练主循环；按 cfg 中的 func 名字跳读即可。
+# N=并行环境数，env_ids=本次重置/更新的环境编号，asset_cfg=要读取的机器人/关节/刚体选择器。
+# 观测函数通常返回 [N,D]，奖励返回 [N] 原始分数，终止返回 [N] 布尔值；事件直接改状态/参数。
+# 简单走路优先看：_servo_joint_ids、robot_state_is_nan、randomize_bam_friction、reward_weight、
+# VelocityCommandCommandOnly、UniformPoseCommand、head_pose_tracking、head_pose_bias_penalty。
+# 开头几个 Patch 在导入时安装到依赖类的方法上，属于实际调用链；不能只读上游原方法就推断行为。
+
 import math
 import os
 from dataclasses import dataclass as _dataclass
@@ -31,6 +38,8 @@ from rsl_rl.algorithms.ppo import PPO as _PPO
 _orig_reward_compute = _RewardManager.compute
 
 def _nan_safe_reward_compute(self, dt: float) -> torch.Tensor:
+    # 外部 RewardManager.compute(dt) → [N] 总奖励：各函数先算原始分数，再乘 weight 和 dt。
+    # self 是外部奖励管理器；这里调用原方法后清理异常奖励/日志，防止污染 PPO 的采样缓存。
     result = _orig_reward_compute(self, dt)
     # _episode_sums is updated inside compute() before nan_to_num can act.
     # Sanitize in-place so per-term metrics don't show NaN.
@@ -51,6 +60,9 @@ _RewardManager.compute = _nan_safe_reward_compute
 _orig_compute_returns = _PPO.compute_returns
 
 def _safe_compute_returns(self, obs) -> None:
+    # 外部 PPO.compute_returns(obs: TensorDict) 无返回值；写入 self.storage.returns/advantages。
+    # obs 是采样片段末尾的观测，用 Critic 做末端价值估计；原方法已完成 GAE 和优势归一化。
+    # 本补丁在原方法返回后把非有限值归零；它是容错，不证明这一段物理仿真正确。
     _orig_compute_returns(self, obs)
     st = self.storage
     torch.nan_to_num_(st.advantages, nan=0.0, posinf=0.0, neginf=0.0)
@@ -78,6 +90,8 @@ from mjlab.rl import exporter_utils as _exporter_utils  # noqa: E402
 from mjlab.envs.mdp.actions import JointPositionAction as _JointAction  # noqa: E402
 
 def _get_base_metadata_no_passive(env, run_path):
+    # 外部 exporter_utils.get_base_metadata(env, run_path) → ONNX 元信息字典。
+    # 这里只保留主动关节：模型可能有被动关节，但动作接口始终对应 14 个舵机。
     robot = env.scene["robot"]
     joint_action = env.action_manager.get_term("joint_pos")
     assert isinstance(joint_action, _JointAction)
@@ -129,6 +143,8 @@ try:
     _orig_runner_load = _MjlabRunner.load
 
     def _load_with_warm_start(self, path, *args, **kwargs):
+        # 外部 Runner.load(checkpoint_path, ...) 恢复权重、归一化器和训练状态，返回 infos 字典。
+        # 普通 resume 保留计数延续课程；显式 warm start 才把环境步计数和训练迭代重置为 0。
         infos = _orig_runner_load(self, path, *args, **kwargs)
         if os.environ.get(WARM_START_ENV, "") not in ("", "0"):
             restored = self.env.unwrapped.common_step_counter
@@ -156,6 +172,8 @@ _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 _NECK_JOINT_PATTERNS = [r".*neck_pitch.*", r".*head_pitch.*", r".*head_yaw.*", r".*head_roll.*"]
 
 
+# 关节接口：asset.data.joint_pos 是 [N,模型全部关节数]，本函数返回其中 14 个舵机的实体内索引。
+# 轮子/齿隙等 passive_* 会插入数组中；固定“第几个关节”不能直接当作“第几个舵机”。
 def _servo_joint_ids(env: "ManagerBasedRlEnv", asset: Entity) -> list:
     """Entity-local indices of the servo (non-``passive_``) joints, cached.
 
@@ -189,6 +207,7 @@ def _env_origin_z(env: "ManagerBasedRlEnv", env_ids: torch.Tensor) -> torch.Tens
 
 
 def _servo_joint_pos(env: "ManagerBasedRlEnv", asset: Entity) -> torch.Tensor:
+    # [N,全部关节] → [N,14] 的舵机视图；这里未加齿隙，输出侧编码器视图另由 backlash 函数处理。
     return asset.data.joint_pos[:, _servo_joint_ids(env, asset)]
 
 
@@ -1102,6 +1121,8 @@ def fallen_too_long(
     return env._fallen_timer_s >= max_duration_s
 
 
+# TerminationManager 回调接口：读取当前 env 的物理/指定传感器数据，返回 [N] 的异常掩码。
+# True 的环境随后自动 reset；检查包含 Inf，而非只检查名字里的 NaN。
 def robot_state_is_nan(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -3349,8 +3370,12 @@ def expand_bam_friction_fields(
     exactly the fields declared by event functions via requires_model_fields,
     so every env using the BAM actuator must register this event.
     """
+    # 外部 requires_model_fields 把所需模型字段声明给 mjlab，供初始化时按环境扩展内存。
+    # 回调本身无计算/返回值；BAM 的实际摩擦在每次物理步计算，不在这个 startup 事件里计算。
 
 
+# EventManager 的 reset 回调：输入 env_ids[M] 和 scale_range，修改选中环境的摩擦倍率，无返回值。
+# 每次恢复基准再采样；M 是本次重置的数量，可能小于总环境数 N。
 def randomize_bam_friction(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -3377,6 +3402,7 @@ def randomize_bam_friction(
     lo, hi = scale_range
     for actuator in asset.actuators:
         if isinstance(actuator, FrictionDRBamActuator):
+            # 本仓库执行器接口：先 reset，再把 [M,1] 倍率广播到该环境的各个受控关节。
             actuator.reset_friction_scale(env_ids)
             samples = torch.rand(len(env_ids), 1, device=env.device) * (hi - lo) + lo
             actuator.set_friction_scale(env_ids, samples)
@@ -3434,6 +3460,8 @@ def randomize_mass_and_inertia(
     env.sim.model.body_inertia[env_ids[:, None], body_indices] *= scales.unsqueeze(-1)  # Scale all 3 inertia components
 
 
+# CurriculumManager 回调：修改命令项 cfg.rel_standing_envs，返回当前比例 [1] 供日志记录。
+# 这是“下次抽命令时抽到待机的概率”，并不直接把所有当前命令立刻改成零。
 def standing_envs_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -3581,6 +3609,8 @@ def wheel_friction_curriculum(
     return torch.tensor([current_ranges[0]])
 
 
+# 课程接口：输入 reward_name 和按环境控制步排列的阶段表，直接更新运行中 RewardManager 的权重。
+# 返回当前权重 Tensor（日志用途），不是新增奖励；env.cfg 中的原始配置副本不是修改目标。
 def reward_weight(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -4740,10 +4770,13 @@ def face_down_prob_curriculum(
     return torch.tensor([current_prob])
 
 
+# 外部 UniformVelocityCommand 接口：cfg 定义采样范围，CommandManager 调用重采样/逐步更新方法。
+# command（继承属性）返回 [N,3] 的机身坐标速度目标 [vx,vy,wz]；观察和跟踪奖励读同一个值。
 class VelocityCommandCommandOnly(UniformVelocityCommand):
     """Like UniformVelocityCommand but only draws the command arrows (no actual velocity arrows)."""
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
+        # 父类先处理普通命令/待机采样；本类再选出“零线速度、明显转向”的专门练习桶。
         super()._resample_command(env_ids)
         # Turn-in-place practice: for a fraction of envs, zero the linear velocity
         # and force a meaningful (away-from-zero) yaw command. Independent uniform
@@ -5301,6 +5334,8 @@ class GroundPickPhaseCommandCfg(UniformVelocityCommandCfg):
 from dataclasses import dataclass, field
 
 
+# 外部 CommandTerm 接口：super(cfg, env) 获取 num_envs/device 等上下文；CommandManager 管理时钟。
+# 本类提供 command:[N,D]，D=len(ranges)；头部 D=4、身体 D=6，重采样之间保持目标不变。
 class UniformPoseCommand(CommandTerm):
     """Generic N-dim uniform pose command.
 
@@ -5333,6 +5368,7 @@ class UniformPoseCommand(CommandTerm):
         r = torch.empty(n, device=self.device)
         for i, (lo, hi) in enumerate(self.cfg.ranges):
             self._command[env_ids, i] = r.uniform_(lo, hi)
+        # 连续随机采样几乎抽不到精确全零；零命令桶显式训练部署时的默认姿态/待机输入。
         # Explicit zero-command bucket. Uniform sampling essentially never
         # produces the all-zero command, so the deployment idle case ("hold the
         # nominal pose") would otherwise be absent from training (velocity
@@ -5352,6 +5388,7 @@ class UniformPoseCommandCfg(CommandTermCfg):
     zero_command_prob: float = 0.0
 
     def build(self, env: ManagerBasedRlEnv) -> "UniformPoseCommand":
+        # 配置 → 运行时命令对象。Manager 调用 build(env)，而不是策略网络自己创建命令。
         return UniformPoseCommand(self, env)
 
 
@@ -5510,6 +5547,8 @@ def zero_command_padding(
     return torch.zeros(env.num_envs, dim, device=env.device)
 
 
+# RewardManager 回调：cmd[N,4] 与输出侧相对 HOME 的头/颈关节角比较，返回 [N]、范围 [0,1]。
+# 外部 Entity.find_joints_by_actuator_names(...) 按名字解析索引；权重/步长由管理器施加。
 def head_pose_tracking(
     env: ManagerBasedRlEnv,
     command_name: str = "head_pose",
@@ -5611,6 +5650,8 @@ def foot_air_time_safe(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor
     return _finite(_velocity_obs.foot_air_time(env, sensor_name))
 
 
+# 奖励接口：同一 [N,4] 头部误差先做时间 EMA，再返回 -mean(abs(EMA))，所以结果已带负号。
+# cfg 必须用正权重；目标是持续下垂的偏差，不是把迈步时不可避免的每次头部摆动都罚掉。
 def head_pose_bias_penalty(
     env: ManagerBasedRlEnv,
     command_name: str = "head_pose",
@@ -5901,6 +5942,7 @@ def body_pose_tracking_locomotion(
     return reward
 
 
+# 参数课程：修改 CommandManager 内命令项的 cfg.ranges；改变后续采样范围，返回幅度指标供日志。
 def pose_command_range_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
